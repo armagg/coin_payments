@@ -140,6 +140,8 @@ export type BitcoinishTxBuildContext = {
   readonly useUnconfirmedUtxos: boolean,
   /** true if fee should be deducted from outputs instead of paid by sender */
   readonly recipientPaysFee: boolean,
+  /** Utxos we must select from */
+  readonly toBeUsedUtxos?: UtxoInfo[],
 
   /** Sum of desiredOutputs value in satoshis */
   desiredOutputTotal: number,
@@ -174,5 +176,5 @@ export type BitcoinishTxBuildContext = {
 
 export type BitcoinishBuildPaymentTxParams = Pick<
   BitcoinishTxBuildContext,
-  'unusedUtxos' | 'desiredOutputs' | 'changeAddress' | 'desiredFeeRate' | 'useAllUtxos' | 'useUnconfirmedUtxos' | 'recipientPaysFee'
+  'unusedUtxos' | 'desiredOutputs' | 'changeAddress' | 'desiredFeeRate' | 'useAllUtxos' | 'useUnconfirmedUtxos' | 'recipientPaysFee' | 'toBeUsedUtxos'
 >

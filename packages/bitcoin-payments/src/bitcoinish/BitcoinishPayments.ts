@@ -36,7 +36,7 @@ import {
   BitcoinishTxBuildContext,
   BitcoinishBuildPaymentTxParams,
 } from './types'
-import { sumUtxoValue, sortUtxos, isConfirmedUtxo, sha256FromHex } from './utils'
+import { sumUtxoValue, shuffleUtxos, isConfirmedUtxo, sha256FromHex } from './utils'
 import { BitcoinishPaymentsUtils } from './BitcoinishPaymentsUtils'
 import BigNumber from 'bignumber.js'
 
@@ -296,30 +296,39 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
 
   private adjustTxFee(tbc: BitcoinishTxBuildContext, newFeeSat: number): void {
     let feeSatAdjustment = newFeeSat - tbc.feeSat
-    if (tbc.recipientPaysFee || tbc.isSweep) {
-      // Share the fee across all outputs. This may increase the fee by as much as 1 sat per output, negligible
-      const outputCount = tbc.externalOutputs.length
-      const feeShare = Math.ceil(feeSatAdjustment / outputCount)
-      feeSatAdjustment = feeShare * outputCount
-      this.logger.log(
-        `${this.coinSymbol} buildPaymentTx - Adjusting external outputs by ${feeSatAdjustment} sat from ${outputCount} outputs (${feeShare} sat each)`
-      )
-      for (let i = 0; i < outputCount; i++) {
-        const externalOutput = tbc.externalOutputs[i]
-        // Explicitly check value before subtracting for an accurate error message
-        if (externalOutput.satoshis - feeShare <= this.dustThreshold) {
-          throw new Error(
-            `${this.coinSymbol} buildPaymentTx - output ${i} for ${externalOutput.satoshis} sat minus ${feeShare} `
-            + `sat fee share is too small to send (below dust threshold of ${this.dustThreshold} sat)`
-          )
-        }
-        externalOutput.satoshis -= feeShare
-      }
-      tbc.externalOutputTotal -= feeSatAdjustment
+    if (!tbc.recipientPaysFee && !tbc.isSweep) {
+      this.applyFeeAdjustment(tbc, feeSatAdjustment)
+      return
     }
+
+    // Share the fee across all outputs. This may increase the fee by as much as 1 sat per output, negligible
+    const outputCount = tbc.externalOutputs.length
+    const feeShare = Math.ceil(feeSatAdjustment / outputCount)
+    feeSatAdjustment = feeShare * outputCount
+    this.logger.log(
+      `${this.coinSymbol} buildPaymentTx - Adjusting external outputs by ${feeSatAdjustment} sat from ${outputCount} outputs (${feeShare} sat each)`
+    )
+    for (let i = 0; i < outputCount; i++) {
+      const externalOutput = tbc.externalOutputs[i]
+      // Explicitly check value before subtracting for an accurate error message
+      if (externalOutput.satoshis - feeShare <= this.dustThreshold) {
+        throw new Error(
+          `${this.coinSymbol} buildPaymentTx - output ${i} for ${externalOutput.satoshis} sat minus ${feeShare} `
+          + `sat fee share is too small to send (below dust threshold of ${this.dustThreshold} sat)`
+        )
+      }
+      externalOutput.satoshis -= feeShare
+    }
+    tbc.externalOutputTotal -= feeSatAdjustment
+
+    this.applyFeeAdjustment(tbc, feeSatAdjustment)
+  }
+
+  private applyFeeAdjustment(tbc: BitcoinishTxBuildContext, feeSatAdjustment: number): void {
     const feeBefore = tbc.feeSat
     tbc.feeSat += feeSatAdjustment
     this.logger.debug(`${this.coinSymbol} buildPaymentTx - Adjusted fee from ${feeBefore} sat to ${tbc.feeSat} sat`)
+    return
   }
 
   /* Select inputs, calculate appropriate fee, set fee, adjust output amounts if necessary */
@@ -341,19 +350,110 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
       })
     }
 
+
+    // TODO
+    // assume that desired fee is passed in tbc
+    // we need to care if utxosTotalSat < tbc.desiredFeeRate
+    // only for selectInputUtxosPartial
+
     if (tbc.useAllUtxos) { // Sweeping or consolidation case
-      tbc.inputUtxos = utxos
-      tbc.inputTotal = utxosTotalSat
-      tbc.isSweep = tbc.useAllUtxos && tbc.desiredOutputTotal >= tbc.inputTotal
-      const feeSat = this.estimateTxFee(tbc.desiredFeeRate, utxos.length, 0, tbc.externalOutputAddresses)
-      this.adjustTxFee(tbc, feeSat)
+      this.selectInputUtxosForAll(tbc, utxos, utxosTotalSat)
     } else { // Sending amount case
+      this.selectInputUtxosPartial(tbc, utxos, utxosTotalSat)
+    }
+
+    // insufficient utxos
+    if (tbc.externalOutputTotal + tbc.feeSat > tbc.inputTotal) {
+      throw new Error(
+        `${this.coinSymbol} buildPaymentTx - You do not have enough UTXOs (${tbc.inputTotal} sat) ` +
+        `to send ${tbc.externalOutputTotal} sat with ${tbc.feeSat} sat fee`
+      )
+    }
+  }
+
+  private selectInputUtxosForAll(tbc: BitcoinishTxBuildContext, utxos: Array<UtxoInfo & { satoshis: number }>, utxosTotalSat: number) {
+    tbc.inputUtxos = utxos
+    tbc.inputTotal = utxosTotalSat
+    tbc.isSweep = tbc.useAllUtxos && tbc.desiredOutputTotal >= tbc.inputTotal
+    const feeSat = this.estimateTxFee(tbc.desiredFeeRate, utxos.length, 0, tbc.externalOutputAddresses)
+    this.adjustTxFee(tbc, feeSat)
+  }
+
+  private selectInputUtxosPartial(tbc: BitcoinishTxBuildContext, utxos: Array<UtxoInfo & { satoshis: number }>, utxosTotalSat: number) {
+    if (tbc.toBeUsedUtxos && tbc.toBeUsedUtxos.length > 0) {
+      console.log('-------------------------------')
+      console.log(tbc)
+      console.log('-------------------------------')
+    //  const targetChangeOutputCount = this.determineTargetChangeOutputCount(
+    //    tbc.unusedUtxos.length,
+    //    tbc.toBeUsedUtxos.length,
+    //  )
+    //  const idealSolutionFeeSat = this.estimateTxFee(
+    //    tbc.desiredFeeRate,
+    //    tbc.toBeUsedUtxos.length,
+    //    targetChangeOutputCount,
+    //    tbc.externalOutputAddresses
+    //  )
+
+    //  const idealSolutionMinSat = tbc.desiredOutputTotal + (tbc.recipientPaysFee ? 0 : idealSolutionFeeSat)
+    //  const idealSolutionMaxSat = idealSolutionMinSat + this.dustThreshold
+
+    //  let selectedUtxos = tbc.toBeUsedUtxos
+    //  let selectedTotalSat = tbc.toBeUsedUtxos.reduce((total, utxo) => total += utxo.satoshis , 0) // Total input sat is accumulated as inputs are added
+
+    //  // not less than tbc.desiredFeeRate!
+    //  let feeSat = this.estimateTxFee(
+    //    tbc.desiredFeeRate, // base per weight
+    //    selectedUtxos.length,
+    //    targetChangeOutputCount,
+    //    tbc.externalOutputAddresses,
+    //  )
+    //  const neededSat = tbc.externalOutputTotal + (tbc.recipientPaysFee ? 0 : feeSat)
+
+    //  if (selectedTotalSat >= neededSat) {
+    //    return
+    //  }
+
+    //  // pick from utxos excluding those in tbc.toBeUsedUtxos
+
+    //  // TODO
+    //  // handle the case if tbc.desiredFeeRate > utxosTotalSat by forcing to pick additional utxo
+    //  // utxos are picked from tbc's utxo
+    //  // question: are utxos in tbc have all available for account or is there any magic happening before?
+    //  // probably options:
+    //  // getUtxos
+    //  //
+    //  //
+    //  //
+    //  //
+    //      // exclude toBeUsedUtxos from utxos
+    //      // push toBeUsedUtxos to selectedUtxos / tbc.inputUtxos
+    //      // UTXO:
+    //      //
+    //      //  {
+    //      //    txid: t.string,
+    //      //    vout: t.number,
+    //      //    value: t.string, // main denomination
+    //      //  },
+    //      // subtract toBeUsedUtxos from utxos
+    //      // put them into selected utxos
+    //      // compute selectedTotalSat
+    //      // compute feeSat
+    //      // if enough for amount and fee -> return
+    //      // this.adjustTxFee(tbc, idealSolutionMinSat)
+    } else {
       // First try to find a single input that covers output without creating change
       const idealSolutionFeeSat = this.estimateTxFee(tbc.desiredFeeRate, 1, 0, tbc.externalOutputAddresses)
       const idealSolutionMinSat = tbc.desiredOutputTotal + (tbc.recipientPaysFee ? 0 : idealSolutionFeeSat)
       const idealSolutionMaxSat = idealSolutionMinSat + this.dustThreshold
+
+      let selectedUtxos = []
+      let selectedTotalSat = 0 // Total input sat is accumulated as inputs are added
+      let feeSat = 0 // Total fee is recalculated when adding each input
+
       for (const utxo of utxos) {
         if (utxo.satoshis >= idealSolutionMinSat && utxo.satoshis <= idealSolutionMaxSat) {
+          // check if there is any perfectly matching utxo to be used
           this.logger.log(`${this.coinSymbol} buildPaymentTx - `
             + `Found ideal ${this.coinSymbol} input utxo solution to send ${tbc.desiredOutputTotal} sat `
             + `${tbc.recipientPaysFee ? 'less' : 'plus'} fee of ${idealSolutionFeeSat} sat `
@@ -367,11 +467,8 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
       }
 
       // Incrementally select utxos until we cover outputs and fees
-      let selectedUtxos = []
-      let selectedTotalSat = 0 // Total input sat is accumulated as inputs are added
-      let feeSat = 0 // Total fee is recalculated when adding each input
-      const sortedUtxos = sortUtxos(utxos)
-      for (const utxo of sortedUtxos) {
+      const shuffledUtxos = shuffleUtxos(utxos)
+      for (const utxo of shuffledUtxos) {
         selectedUtxos.push(utxo)
         selectedTotalSat += utxo.satoshis
         const targetChangeOutputCount = this.determineTargetChangeOutputCount(
@@ -392,14 +489,6 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
       tbc.inputUtxos = selectedUtxos
       tbc.inputTotal = selectedTotalSat
       this.adjustTxFee(tbc, feeSat)
-    }
-
-    // insufficient utxos
-    if (tbc.externalOutputTotal + tbc.feeSat > tbc.inputTotal) {
-      throw new Error(
-        `${this.coinSymbol} buildPaymentTx - You do not have enough UTXOs (${tbc.inputTotal} sat) ` +
-        `to send ${tbc.externalOutputTotal} sat with ${tbc.feeSat} sat fee`
-      )
     }
   }
 
@@ -499,6 +588,7 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
    * then converted back to strings before being returned.
    */
   async buildPaymentTx(params: BitcoinishBuildPaymentTxParams): Promise<Required<BitcoinishPaymentTx>> {
+    // TODO: accept parameter for reuse of same utxo
     const tbc: BitcoinishTxBuildContext = {
       ...params,
       desiredOutputTotal: 0,
@@ -703,7 +793,15 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
 
   async getTransactionInfo(txId: string): Promise<BitcoinishTransactionInfo> {
     const tx = await this._retryDced(() => this.getApi().getTx(txId))
+
     const fee = this.toMainDenominationString(tx.fees)
+
+    const currentBlock = await this._retryDced(() => this.getBlock())
+    console.log('----------------------------')
+    console.log('CURRENT BLOCK:', currentBlock)
+    console.log('----------------------------')
+    const currentBlockNumber = currentBlock.height
+
     const confirmationId = tx.blockHash || null
     const confirmationNumber = tx.blockHeight ? String(tx.blockHeight) : undefined
     const confirmationTimestamp = tx.blockTime ? new Date(tx.blockTime * 1000) : null
@@ -758,6 +856,7 @@ export abstract class BitcoinishPayments<Config extends BaseConfig> extends Bitc
       sequenceNumber: null,
       confirmationId,
       confirmationNumber,
+      currentBlockNumber,
       confirmationTimestamp,
       isExecuted: isConfirmed,
       isConfirmed,
